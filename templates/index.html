@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG Chatbot</title>
+  <style>
+      body {
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          margin: 0;
+          padding: 0;
+          background-color: #f7f7f8;
+      }
+
+      .container {
+          display: flex;
+          height: 100vh;
+      }
+
+      .sidebar {
+          width: 260px;
+          background-color: #202123;
+          padding: 20px;
+          color: white;
+      }
+
+      .main-content {
+          flex: 1;
+          display: flex;
+          flex-direction: column;
+      }
+
+      .chat-container {
+          flex: 1;
+          overflow-y: auto;
+          padding: 20px;
+      }
+
+      .message {
+          max-width: 800px;
+          margin: 20px auto;
+          padding: 15px;
+          border-radius: 8px;
+      }
+
+      .user-message {
+          background-color: #ffffff;
+      }
+
+      .assistant-message {
+          background-color: #f7f7f8;
+      }
+
+      .input-container {
+          padding: 20px;
+          background-color: #ffffff;
+          border-top: 1px solid #e5e5e5;
+      }
+
+      .input-box {
+          max-width: 800px;
+          margin: 0 auto;
+          display: flex;
+          gap: 10px;
+      }
+
+      textarea {
+          flex: 1;
+          padding: 12px;
+          border: 1px solid #e5e5e5;
+          border-radius: 8px;
+          resize: none;
+          height: 50px;
+      }
+
+      button {
+          padding: 10px 20px;
+          background-color: #10a37f;
+          color: white;
+          border: none;
+          border-radius: 8px;
+          cursor: pointer;
+      }
+
+      button:hover {
+          background-color: #0e906f;
+      }
+
+      .file-upload {
+          margin-bottom: 20px;
+      }
+
+      .new-chat {
+          width: 100%;
+          padding: 10px;
+          margin-bottom: 20px;
+          background-color: #343541;
+          border: 1px solid #565869;
+          color: white;
+          border-radius: 8px;
+          cursor: pointer;
+      }
+  </style>
+</head>
+<body>
+  <div class="container">
+      <div class="sidebar">
+          <button class="new-chat">New Chat</button>
+          <div class="file-upload">
+              <input type="file" id="pdf-upload" multiple accept=".pdf" style="display: none;">
+              <button onclick="document.getElementById('pdf-upload').click()">Upload PDFs</button>
+          </div>
+      </div>
+        
+      <div class="main-content">
+          <div class="chat-container" id="chat-container">
+              <!-- Messages will be inserted here -->
+          </div>
+            
+          <div class="input-container">
+              <div class="input-box">
+                  <textarea id="user-input" placeholder="Type your message here..."></textarea>
+                  <button onclick="sendMessage()">Send</button>
+              </div>
+          </div>
+      </div>
+  </div>
+
+  <script>
+      let chatHistory = [];
+
+      document.getElementById('pdf-upload').addEventListener('change', async (e) => {
+          const files = e.target.files;
+          const formData = new FormData();
+            
+          for (let file of files) {
+              formData.append('files', file);
+          }
+
+          try {
+              const response = await fetch('/process', {
+                  method: 'POST',
+                  body: formData
+              });
+              const result = await response.json();
+              addMessage('system', 'PDFs processed successfully!');
+          } catch (error) {
+              addMessage('system', 'Error processing PDFs: ' + error.message);
+          }
+      });
+
+      async function sendMessage() {
+          const input = document.getElementById('user-input');
+          const message = input.value.trim();
+            
+          if (!message) return;
+
+          addMessage('user', message);
+          input.value = '';
+
+          try {
+              const response = await fetch('/query', {
+                  method: 'POST',
+                  headers: {
+                      'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                      question: message
+                  })
+              });
+                
+              if (!response.ok) {
+                  throw new Error('Network response was not ok');
+              }
+                
+              const result = await response.json();
+              addMessage('assistant', result.messages[0].content);
+          } catch (error) {
+              addMessage('system', 'Error: ' + error.message);
+          }
+      }
+
+      function addMessage(role, content) {
+          const chatContainer = document.getElementById('chat-container');
+          const messageDiv = document.createElement('div');
+          messageDiv.className = `message ${role}-message`;
+          messageDiv.textContent = content;
+          chatContainer.appendChild(messageDiv);
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
+
+      document.getElementById('user-input').addEventListener('keypress', (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              sendMessage();
+          }
+      });
+
+      document.querySelector('.new-chat').addEventListener('click', () => {
+          document.getElementById('chat-container').innerHTML = '';
+          chatHistory = [];
+      });
+  </script>
+</body>
+</html>
