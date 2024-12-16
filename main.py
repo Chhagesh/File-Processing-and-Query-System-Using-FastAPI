@@ -1,27 +1,23 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 import tempfile
 import os
 from dotenv import load_dotenv
-from langchain.schema import Document
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_community.vectorstores import Chroma
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+import PyPDF2
+from io import StringIO
+import csv
+import pandas as pd
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain.embeddings import HuggingFaceEmbeddings
-from model import llm
+from langchain_community.vectorstores import Chroma
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
 import datetime
 import uuid
-import PyPDF2
 
-
-# Load environment variables
+# Load environment variables and initialize FastAPI
 load_dotenv()
-
-# Initialize FastAPI
 app = FastAPI()
 
 # Configure CORS
@@ -33,67 +29,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Directories
-UPLOAD_DIR = "./uploaded_files"
-current_dir = os.path.dirname(os.path.abspath(__file__))
-persistent_directory = os.path.join(current_dir, "db", "chroma_db_with_metadata")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Initialize models
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+model = SentenceTransformer('all-MiniLM-L6-v2')
+genai.configure(api_key="Here is your API KEY ") #----------------------------------------------attention ------------------------------------------
 
-# Initialize models and chains
-embeddings = HuggingFaceEmbeddings()
-
-# Setup prompts
-contextualize_q_system_prompt = """Given a chat history and the latest user question 
-which might reference context in the chat history, formulate a standalone question which can be understood 
-without the chat history. Do NOT answer the question, just reformulate it if needed and otherwise return it as is."""
-
-qa_system_prompt = """You are an assistant for question-answering tasks. Use 
-the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you 
-don't know. Use three sentences maximum and keep the answer concise.\n\n{context}"""
-
-contextualize_q_prompt = ChatPromptTemplate.from_messages([
-    ("system", contextualize_q_system_prompt),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}"),
-])
-
-qa_prompt = ChatPromptTemplate.from_messages([
-    ("system", qa_system_prompt),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}"),
-])
-
-def extract_text_from_pdf(pdf_path):
-    documents = []
-    try:
-        with open(pdf_path, "rb") as file:
-            reader = PyPDF2.PdfReader(file)
-            for page_num, page in enumerate(reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    page_text = "\n".join([line for line in page_text.splitlines() if line.strip()])
-                    doc = Document(
-                        page_content=page_text,
-                        metadata={"source": pdf_path, "page": page_num + 1}
-                    )
-                    documents.append(doc)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing {pdf_path}: {str(e)}")
-    return documents
-
-def process_multiple_pdfs(files):
-    all_documents = []
-    for file in files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(file.file.read())
-            pdf_path = tmp_file.name
-            original_filename = file.filename
-        documents = extract_text_from_pdf(pdf_path)
-        for doc in documents:
-            doc.metadata["source"] = original_filename
-        all_documents.extend(documents)
-        os.unlink(pdf_path)
-    return all_documents
+def pdf_to_csv_in_memory(pdf_file):
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    all_text = []
+    
+    for page in pdf_reader.pages:
+        text = page.extract_text()
+        if text:
+            lines = text.split("\n")
+            all_text.append(lines)
+    
+    csv_output = StringIO()
+    csv_writer = csv.writer(csv_output)
+    for page_text in all_text:
+        for line in page_text:
+            csv_writer.writerow([line])
+    
+    csv_output.seek(0)
+    df = pd.read_csv(csv_output)
+    return df
 
 @app.get("/")
 async def serve_homepage():
@@ -103,63 +62,120 @@ async def serve_homepage():
 async def process_pdfs(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
-
-    all_documents = process_multiple_pdfs(files)
-
-    # Create vector store
-    db = Chroma.from_documents(
-        all_documents,
-        embeddings,
-        persist_directory=persistent_directory
-    )
     
-    # Create retriever
-    retriever = db.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 3},
-    )
-
-    # Create chains
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
-    
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    
-    # Store the chain in app state
-    app.state.chain = rag_chain
-    app.state.chat_history = []
-
-    return {"status": "success", "documents_processed": len(all_documents)}
+    try:
+        # Process the first PDF file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(await files[0].read())
+            tmp_file.seek(0)
+            
+            # Convert PDF to CSV in memory
+            df = pdf_to_csv_in_memory(tmp_file)
+            
+            # Detect text column
+            text_column = None
+            for col in df.columns:
+                if df[col].dtype == object:
+                    text_column = col
+                    break
+            
+            if text_column is None:
+                raise ValueError("No text column found in the CSV data.")
+            
+            # Combine text and create documents
+            response = " ".join(df[text_column].dropna().tolist())
+            text_splitter = SemanticChunker(
+                HuggingFaceEmbeddings(),
+                breakpoint_threshold_type="percentile"
+            )
+            documents = text_splitter.create_documents([response])
+            
+            # Create vector store
+            vectorstore = Chroma.from_documents(documents=documents, embedding=embedding_model)
+            
+            # Create retriever
+            retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 8})
+            
+            # Store in app state
+            app.state.retriever = retriever
+            
+            return {"status": "success", "message": "PDF processed successfully"}
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query")
 async def query_documents(body: dict = Body(...)):
-    if not hasattr(app.state, "chain"):
+    if not hasattr(app.state, "retriever"):
         raise HTTPException(status_code=400, detail="No documents have been processed yet.")
-
+    
     question = body.get("question")
     if not question:
         raise HTTPException(status_code=422, detail="Question field is required")
-
+    
     try:
-        result = app.state.chain.invoke({
-            "input": question,
-            "chat_history": app.state.chat_history
-        })
+        # Get relevant documents
+        relevant_chunks = app.state.retriever.get_relevant_documents(question)
         
-        # Update chat history
-        app.state.chat_history.append(HumanMessage(content=question))
-        app.state.chat_history.append(SystemMessage(content=result["answer"]))
+        # Check if question needs tabular response
+        table_keywords = ['table', 'data', 'numbers', 'statistics', 'figures', 'comparison', 'metrics']
+        needs_table = any(keyword in question.lower() for keyword in table_keywords)
+        
+        # Define base prompt structure
+        if needs_table:
+            prompt_structure = {
+                "query": "the original question",
+                "response": {
+                    "summary": "Clear and concise summary",
+                    "key_points": {
+                        "name of key point1": "First key finding",
+                        "name of key point2": "Second key finding"
+                    },
+                    "tables": [{
+                        "title": "Relevant table name",
+                        "headers": ["Column1", "Column2"],
+                        "rows": [["Value1", "Value2"]]
+                    }]
+                }
+            }
+        else:
+            prompt_structure = {
+                "query": "the original question",
+                "response": {
+                    "summary": "Clear and concise summary",
+                    "key_points": {
+                        "name of key point1": "First key finding",
+                        "name of key point2": "Second key finding"
+                    }
+                }
+            }
 
+        structured_prompt = f"""
+        -YOU ARE HELP FUL ASSISTANT WHICH PERFORM MATHS WITH THE DATA ACCORDING TO THE QUESTION.
+        Generate a response in this exact JSON structure:
+        {prompt_structure}
+
+        Context:
+        {relevant_chunks}
+
+        Question:
+        {question}
+
+        Provide only the JSON response with named key points.
+        """
+        
+        # Generate response using Gemini
+        gemini_model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        response = gemini_model.generate_content(structured_prompt)
+        
         return JSONResponse(content={
             "messages": [{
                 "role": "assistant",
-                "content": result["answer"],
+                "content": response.text,
                 "timestamp": str(datetime.datetime.now())
             }],
             "conversation_id": str(uuid.uuid4())
         })
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating answer: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
